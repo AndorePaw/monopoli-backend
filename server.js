@@ -1,7 +1,6 @@
 
 'use strict';
-
-// Server otoritatif Monopoli GB.
+// Server otoritatif Monopoli GB. Semua uang, dadu, sewa, dan giliran diputuskan di sini.
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -10,28 +9,21 @@ const crypto = require('crypto');
 const app = express();
 const server = http.createServer(app);
 
+// ALLOWED_ORIGINS dapat berisi beberapa domain, dipisahkan koma.
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '*')
   .split(',')
   .map(x => x.trim())
   .filter(Boolean);
 
 const corsOrigin = (origin, callback) => {
-  if (
-    !origin ||
-    allowedOrigins.includes('*') ||
-    allowedOrigins.includes(origin)
-  ) {
+  if (!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
     return callback(null, true);
   }
-
   return callback(new Error('Origin tidak diizinkan oleh ALLOWED_ORIGINS'));
 };
 
 const io = new Server(server, {
-  cors: {
-    origin: corsOrigin,
-    methods: ['GET', 'POST']
-  }
+  cors: { origin: corsOrigin, methods: ['GET', 'POST'] }
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
@@ -39,15 +31,8 @@ app.use(express.static(__dirname));
 
 const PORT = process.env.PORT || 3000;
 
-const COLORS = [
-  '#f5b942', '#38bdf8', '#fb7185', '#a78bfa',
-  '#4ade80', '#fb923c', '#e879f9'
-];
-
-const AVATARS = [
-  '😎', '🐱', '🐸', '🦊', '🐼',
-  '🐯', '🐙', '🐧', '🦄', '👾'
-];
+const COLORS = ['#f5b942', '#38bdf8', '#fb7185', '#a78bfa', '#4ade80', '#fb923c', '#e879f9'];
+const AVATARS = ['😎', '🐱', '🐸', '🦊', '🐼', '🐯', '🐙', '🐧', '🦄', '👾'];
 
 const GROUPS = {
   brown: { tiles: [1, 3], house: 50, color: '#a66b43' },
@@ -145,22 +130,10 @@ function roomCode() {
 
 function freshRoom(code) {
   return {
-    code,
-    host: null,
-    started: false,
-    players: [],
-    turn: 0,
-    phase: 'lobby',
-    deadline: null,
-    turnTimer: null,
-    disconnectTimers: {},
-    props: {},
-    history: [],
-    lastEvents: [],
-    doubleStreak: 0,
-    turnRolls: 0,
-    winner: null,
-    round: 1
+    code, host: null, started: false, players: [], turn: 0,
+    phase: 'lobby', deadline: null, turnTimer: null,
+    disconnectTimers: {}, props: {}, history: [], lastEvents: [],
+    doubleStreak: 0, turnRolls: 0, winner: null, round: 1
   };
 }
 
@@ -212,10 +185,7 @@ function publicState(r) {
   const props = {};
   for (const [id, v] of Object.entries(r.props)) {
     const owner = playerByToken(r, v.owner);
-    props[id] = {
-      owner: owner?.id || null,
-      houses: v.houses || 0
-    };
+    props[id] = { owner: owner?.id || null, houses: v.houses || 0 };
   }
 
   return {
@@ -243,10 +213,7 @@ function pushHistory(r, text) {
 
 function emitState(r, events = []) {
   r.lastEvents = events;
-  io.to(r.code).emit('update', {
-    state: publicState(r),
-    events
-  });
+  io.to(r.code).emit('update', { state: publicState(r), events });
 }
 
 function stopTimer(r) {
@@ -309,10 +276,7 @@ function finishGame(r) {
   );
 
   r.winner = ranking[0]?.token || null;
-  pushHistory(
-    r,
-    `${playerByToken(r, r.winner)?.name || 'Pemain'} memenangkan permainan!`
-  );
+  pushHistory(r, `${playerByToken(r, r.winner)?.name || 'Pemain'} memenangkan permainan!`);
   emitState(r, [{ type: 'bk', winner: r.winner }]);
 }
 
@@ -321,9 +285,7 @@ function pay(r, p, amount, creditor, events) {
   if (amount <= 0) return true;
 
   if (p.cash < amount) {
-    const owned = Object.entries(r.props)
-      .filter(([, v]) => v.owner === p.token);
-
+    const owned = Object.entries(r.props).filter(([, v]) => v.owner === p.token);
     for (const [id] of owned) delete r.props[id];
 
     p.cash = 0;
@@ -355,9 +317,7 @@ function gain(r, p, amount, events) {
 
 function movePlayer(r, p, steps, events, opts = {}) {
   const old = p.pos;
-  const next = opts.to !== undefined
-    ? opts.to
-    : (p.pos + steps + 40) % 40;
+  const next = opts.to !== undefined ? opts.to : (p.pos + steps + 40) % 40;
 
   if (opts.to === undefined && steps > 0 && p.pos + steps >= 40) {
     gain(r, p, 200, events);
@@ -394,36 +354,26 @@ function rentFor(r, p, id, diceTotal = 0) {
   }
 
   if (tile.type === 'utility') {
-    const n = [12, 28].filter(
-      i => r.props[i]?.owner === own.token
-    ).length;
+    const n = [12, 28].filter(i => r.props[i]?.owner === own.token).length;
     return diceTotal * (n === 2 ? 10 : 4);
   }
 
   const h = pr.houses || 0;
   const base = Math.round(tile.price / 16);
   const mult = [1, 5, 15, 40, 55, 70][Math.min(h, 5)];
-  return base * mult *
-    (groupOwned(r, own, tile.group) && h === 0 ? 2 : 1);
+  return base * mult * (groupOwned(r, own, tile.group) && h === 0 ? 2 : 1);
 }
 
 function resolveLanding(r, p, diceTotal, events) {
   const tile = BOARD[p.pos];
 
-  if (
-    tile.type === 'property' ||
-    tile.type === 'airport' ||
-    tile.type === 'utility'
-  ) {
+  if (tile.type === 'property' || tile.type === 'airport' || tile.type === 'utility') {
     const pr = r.props[tile.id];
 
     if (!pr) {
       r.phase = 'buy';
       r.pendingBuy = tile.id;
-      pushHistory(
-        r,
-        `${p.name} tiba di ${tile.name}. Properti tersedia untuk dibeli.`
-      );
+      pushHistory(r, `${p.name} tiba di ${tile.name}. Properti tersedia untuk dibeli.`);
       return;
     }
 
@@ -432,10 +382,7 @@ function resolveLanding(r, p, diceTotal, events) {
       if (rent) {
         const ok = pay(r, p, rent, pr.owner, events);
         if (ok) {
-          pushHistory(
-            r,
-            `${p.name} membayar sewa Rp ${(rent * 1000).toLocaleString('id-ID')} ke ${playerByToken(r, pr.owner)?.name || 'pemilik'}.`
-          );
+          pushHistory(r, `${p.name} membayar sewa Rp ${(rent * 1000).toLocaleString('id-ID')} ke ${playerByToken(r, pr.owner)?.name || 'pemilik'}.`);
         } else {
           pushHistory(r, `${p.name} tidak mampu membayar sewa dan bangkrut.`);
         }
@@ -443,10 +390,7 @@ function resolveLanding(r, p, diceTotal, events) {
     }
   } else if (tile.type === 'tax') {
     pay(r, p, tile.price, 'BANK', events);
-    pushHistory(
-      r,
-      `${p.name} membayar pajak Rp ${(tile.price * 1000).toLocaleString('id-ID')}.`
-    );
+    pushHistory(r, `${p.name} membayar pajak Rp ${(tile.price * 1000).toLocaleString('id-ID')}.`);
   } else if (tile.type === 'gotojail') {
     p.pos = 10;
     p.jailed = true;
@@ -563,7 +507,6 @@ function autoRoll(r, p, timed = false) {
 function finishTurn(r, rollAgain) {
   stopTimer(r);
   r.pendingBuy = null;
-
   if (r.phase === 'gameover') return;
 
   if (rollAgain) {
@@ -575,15 +518,13 @@ function finishTurn(r, rollAgain) {
 
   r.extraDouble = false;
 
-  // FIX: objek room harus diberikan sebagai argumen pertama.
+  // Perbaikan: berikan objek room sebagai argumen pertama.
   nextTurn(r, false);
 }
 
 function canAct(r, p) {
-  return r.started &&
-    r.phase !== 'gameover' &&
-    active(r)?.token === p.token &&
-    !p.bankrupt;
+  return r.started && r.phase !== 'gameover' &&
+    active(r)?.token === p.token && !p.bankrupt;
 }
 
 function error(socket, msg) {
@@ -613,32 +554,22 @@ function joinRoom(socket, payload, create) {
       .toUpperCase()
       .replace(/[^A-Z0-9]/g, '')
       .slice(0, 4);
-
     r = rooms.get(code);
-    if (!r) {
-      return error(socket, 'Kode room tidak ditemukan. Periksa 4 huruf/angka.');
-    }
+    if (!r) return error(socket, 'Kode room tidak ditemukan. Periksa 4 huruf/angka.');
   }
 
   let p = playerByToken(r, token);
 
   if (!p) {
-    if (r.started) {
-      return error(socket, 'Game sudah dimulai. Room tidak menerima pemain baru.');
-    }
-
-    if (r.players.length >= 7) {
-      return error(socket, 'Room penuh (maksimal 7 pemain).');
-    }
+    if (r.started) return error(socket, 'Game sudah dimulai. Room tidak menerima pemain baru.');
+    if (r.players.length >= 7) return error(socket, 'Room penuh (maksimal 7 pemain).');
 
     p = {
       id: crypto.randomUUID(),
       token,
       name: sanitizeName(payload.name),
       avatar: AVATARS.includes(payload.avatar) ? payload.avatar : '😎',
-      color: COLORS.includes(payload.color)
-        ? payload.color
-        : COLORS[r.players.length % COLORS.length],
+      color: COLORS.includes(payload.color) ? payload.color : COLORS[r.players.length % COLORS.length],
       cash: 1500,
       pos: 0,
       connected: true,
@@ -656,7 +587,6 @@ function joinRoom(socket, payload, create) {
   } else {
     p.connected = true;
     p.socketId = socket.id;
-
     if (r.disconnectTimers[token]) {
       clearTimeout(r.disconnectTimers[token]);
       delete r.disconnectTimers[token];
@@ -666,14 +596,7 @@ function joinRoom(socket, payload, create) {
   socket.join(r.code);
   socket.data.room = r.code;
   socket.data.token = token;
-
-  socket.emit('joined', {
-    token,
-    code: r.code,
-    playerId: p.id,
-    created: create
-  });
-
+  socket.emit('joined', { token, code: r.code, playerId: p.id, created: create });
   emitState(r);
 }
 
@@ -695,13 +618,9 @@ function doAction(socket, action, data = {}) {
   }
 
   if (action === 'kick') {
-    if (r.started || !host) {
-      return error(socket, 'Hanya host di lobby yang bisa mengeluarkan pemain.');
-    }
-
+    if (r.started || !host) return error(socket, 'Hanya host di lobby yang bisa mengeluarkan pemain.');
     const target = r.players.find(x => x.id === String(data.token || ''));
     if (!target || target.token === r.host) return;
-
     if (target.socketId) io.to(target.socketId).emit('kicked');
     r.players = r.players.filter(x => x !== target);
     pushHistory(r, `${target.name} dikeluarkan dari room.`);
@@ -710,19 +629,14 @@ function doAction(socket, action, data = {}) {
   }
 
   if (action === 'start') {
-    if (!host || r.started) {
-      return error(socket, 'Hanya host yang dapat memulai game.');
-    }
-
+    if (!host || r.started) return error(socket, 'Hanya host yang dapat memulai game.');
     if (r.players.length < 2 || r.players.some(x => !x.ready)) {
       return error(socket, 'Minimal 2 pemain dan semua pemain harus siap.');
     }
-
     r.started = true;
     r.phase = 'roll';
     r.turn = 0;
     r.deadline = Date.now() + 60000;
-
     pushHistory(r, 'Permainan dimulai!');
     setTimer(r);
     emitState(r, [{ type: 'card', text: 'Permainan dimulai!' }]);
@@ -732,14 +646,9 @@ function doAction(socket, action, data = {}) {
   if (action === 'react') {
     const now = Date.now();
     if ((socket.data.reactAt || 0) > now - 900) return;
-
     socket.data.reactAt = now;
-
     if (['👏', '😂', '😭', '🔥'].includes(data.emoji)) {
-      io.to(r.code).emit('reaction', {
-        token: p.id,
-        emoji: data.emoji
-      });
+      io.to(r.code).emit('reaction', { token: p.id, emoji: data.emoji });
     }
     return;
   }
@@ -748,7 +657,6 @@ function doAction(socket, action, data = {}) {
     if (r.phase !== 'gameover' || !host) {
       return error(socket, 'Hanya host setelah game selesai yang bisa memulai ulang.');
     }
-
     stopTimer(r);
     r.started = false;
     r.phase = 'lobby';
@@ -756,7 +664,6 @@ function doAction(socket, action, data = {}) {
     r.props = {};
     r.turn = 0;
     r.doubleStreak = 0;
-
     r.players.forEach(x => {
       x.cash = 1500;
       x.pos = 0;
@@ -765,29 +672,30 @@ function doAction(socket, action, data = {}) {
       x.bankrupt = false;
       x.ready = x.token === r.host;
     });
-
     pushHistory(r, 'Rematch dimulai. Semua pemain kembali ke lobby.');
     emitState(r);
     return;
   }
 
-  if (!canAct(r, p)) {
-    return error(socket, 'Bukan giliranmu atau fase aksi sudah berubah.');
-  }
+  if (!canAct(r, p)) return error(socket, 'Bukan giliranmu atau fase aksi sudah berubah.');
 
   if (action === 'roll') {
-    if (r.phase !== 'roll') {
-      return error(socket, 'Belum bisa melempar dadu pada fase ini.');
-    }
-
+    if (r.phase !== 'roll') return error(socket, 'Belum bisa melempar dadu pada fase ini.');
     autoRoll(r, p);
     return;
   }
 
   if (action === 'payjail') {
-    if (r.phase !== 'roll' || !p.jailed) {
-      return error(socket, 'Kamu tidak sedang berada di penjara.');
-    }
+    if (r.phase !== 'roll' || !p.jailed) return error(socket, 'Kamu tidak sedang berada di penjara.');
+    if (p.cash < 50) return error(socket, 'Uang tidak cukup untuk membayar Rp 50.000.');
+    p.cash -= 50;
+    p.jailed = false;
+    p.jailFails = 0;
+    pushHistory(r, `${p.name} membayar Rp 50.000 untuk keluar dari penjara.`);
+    events.push({ type: '$', token: p.id, amount: -50 });
+    emitState(r, events);
+    return;
+  }
 
-    if (p.cash < 50) {
-      return error(socket, 'Uang tidak cukup untuk membayar Rp 50.000.');
+  if (action === 'buy') {
+    if (r.phase !== 'buy' || r.pendingBuy == null) return error
