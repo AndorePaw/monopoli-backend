@@ -20,6 +20,16 @@ const io = new Server(server, {
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/healthz', (req, res) => res.send('ok'));
 
+// ====== SAFETY NET ======
+// Jangan biarkan satu error tak terduga mematikan seluruh server (semua room hilang).
+// Cukup log ke console; room lain tetap jalan.
+process.on('uncaughtException', err => {
+  console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+});
+process.on('unhandledRejection', reason => {
+  console.error('[unhandledRejection]', reason && reason.stack ? reason.stack : reason);
+});
+
 // ====== DATA PAPAN ======
 // t: type (go, prop, rr, util, tax, chance, chest, jail, free, gotojail)
 const B = [
@@ -69,9 +79,10 @@ const HOUSE_COST = [50, 50, 100, 100, 150, 150, 200, 200];
 const RENT_MULT = [1, 5, 15, 40, 55, 70];
 const START_CASH = 1500, GO_SALARY = 200, JAIL_FEE = 50, JAIL_POS = 10;
 const TURN_MS = 60000, DISC_MS = 60000;
+const ABANDON_MS = 5 * 60 * 1000; // pemain putus > 5 menit dianggap menyerah (bangkrut)
 
 // Kartu: [teks, jenis, nilai]
-// jenis: cash (+/-), goto (maju ke petak), back (mundur n), jail, allpay (bayar tiap pemain), allget (terima dari tiap pemain)
+// jenis: cash (+/-), goto (maju ke petak), back (mundur n), jail, allpay, allget
 const CHANCE = [
   ['Maju ke START, terima 200', 'goto', 0],
   ['Maju ke Tokyo', 'goto', 11],
@@ -134,13 +145,16 @@ function makeRoom(code) {
   return {
     code, players: [], hostId: null, phase: 'lobby', // lobby | roll | act | buy | over
     turn: 0, owner: {}, houses: {}, dice: [0, 0], log: [], logc: 0, seq: 0, lastActive: Date.now(),
-    chanceDeck: [], chestDeck: [], deadline: 0, timer: null, pendingBuy: null,
-    lastReact: {}, winnerId: null, stats: null, busyUntil: 0, rolled: false, extraTurn: false,
+    chanceDeck: [], chestDeck: [], deadline: 0,
+    timer: null, discTimer: null, autoPlaying: false,
+    pendingBuy: null,
+    winnerId: null, stats: null, busyUntil: 0, extraTurn: false,
+    lastReact: {},
   };
 }
 function resetGame(r) {
   r.owner = {}; r.houses = {}; r.turn = 0; r.dice = [0, 0]; r.log = []; r.pendingBuy = null;
-  r.winnerId = null; r.stats = null; r.rolled = false; r.extraTurn = false;
+  r.winnerId = null; r.stats = null; r.extraTurn = false;
   r.chanceDeck = shuffle([...CHANCE.keys()]); r.chestDeck = shuffle([...CHEST.keys()]);
   r.players.forEach(p => {
     Object.assign(p, { cash: START_CASH, pos: 0, jail: 0, jailTurns: 0, alive: true, props: [], rentPaid: 0, doubles: 0, hasJailCard: false });
@@ -206,18 +220,27 @@ function evDuration(evs) {
 }
 
 // ====== TIMER GILIRAN ======
-function clearTimer(r) { if (r.timer) { clearTimeout(r.timer); r.timer = null; } clearDiscTimer(r); }
-function clearDiscTimer(r) { if (r.discTimer) { clearTimeout(r.discTimer); r.discTimer = null; } }
+function clearTimer(r) {
+  if (r.timer) { clearTimeout(r.timer); r.timer = null; }
+  if (r.discTimer) { clearTimeout(r.discTimer); r.discTimer = null; }
+}
 function armTimer(r, extraMs) {
-  clearTimer(r);
+  if (r.timer) { clearTimeout(r.timer); r.timer = null; }
   if (r.phase === 'lobby' || r.phase === 'over') { r.deadline = 0; return; }
   const cur = r.players[r.turn];
   const wait = (cur && !cur.connected && Date.now() - cur.discAt >= DISC_MS) ? 1200 : TURN_MS;
   r.deadline = Date.now() + wait + (extraMs || 0);
   r.timer = setTimeout(() => autoPlay(r), wait + (extraMs || 0) + 100);
 }
+// autoPlay dibungkus guard supaya timer giliran & discTimer tidak memanggil bersamaan
 function autoPlay(r) {
   if (r.phase === 'lobby' || r.phase === 'over') return;
+  if (r.autoPlaying) return;
+  r.autoPlaying = true;
+  try { autoPlayInner(r); }
+  finally { r.autoPlaying = false; }
+}
+function autoPlayInner(r) {
   const p = r.players[r.turn];
   if (!p || !p.alive) return;
   // pemain putus lebih dari 60 detik: giliran dilewati
@@ -225,18 +248,21 @@ function autoPlay(r) {
     const ev0 = [];
     r.pendingBuy = null; r.extraTurn = false;
     addLog(r, `${p.name} tidak terhubung, giliran dilewati`);
+    // kalau sudah benar-benar lama (abandon), anggap menyerah → bangkrut ke bank
+    if (Date.now() - p.discAt >= ABANDON_MS) {
+      addLog(r, `${p.name} dinyatakan menyerah (lama tidak kembali)`);
+      bankrupt(r, p, null, ev0);
+      if (checkWin(r, ev0)) { emitState(r, ev0, evDuration(ev0)); return; }
+    }
     endTurn(r, ev0); finish(r, ev0); return;
   }
   // habis waktu: lempar otomatis dan selesai tanpa membeli
   const evs = [];
   if (r.phase === 'roll') {
-    if (p.jail > 0) { // di penjara: coba lempar
-      doRoll(r, p, evs);
-    } else doRoll(r, p, evs);
+    doRoll(r, p, evs);
   }
   if (r.phase === 'buy') { r.pendingBuy = null; r.phase = 'act'; }
   if (r.phase === 'act' || r.phase === 'roll') {
-    // jika dadu kembar memberi giliran lagi, tetap otomatis lempar sampai selesai
     let guard = 0;
     while (r.phase === 'roll' && guard++ < 4 && r.players[r.turn] === p && p.alive) {
       doRoll(r, p, evs);
@@ -249,10 +275,8 @@ function autoPlay(r) {
 
 // ====== INTI GAME ======
 function transfer(r, from, to, amt, evs, why) {
-  // from/to: pemain atau null (bank). Mengembalikan true jika berhasil bayar penuh
   if (amt <= 0) return true;
   if (from && from.cash < amt) {
-    // tidak mampu bayar: bangkrut, semua uang sisa ke kreditor
     const got = from.cash;
     if (to && got > 0) { to.cash += got; evs.push({ k: '$', p: to.id, v: got }); }
     if (from) { evs.push({ k: '$', p: from.id, v: -got }); from.cash = 0; }
@@ -296,7 +320,6 @@ function checkWin(r, evs) {
   return false;
 }
 function moveTo(r, p, target, evs, forward, collect) {
-  // gerak maju petak demi petak (mv) atau lompat (tp)
   if (forward) {
     const steps = (target - p.pos + 40) % 40;
     const passGo = p.pos + steps >= 40;
@@ -348,7 +371,7 @@ function drawCard(r, p, kind, evs, diceTotal) {
     if (val > 0) { p.cash += val; evs.push({ k: '$', p: p.id, v: val }); }
     else transfer(r, p, null, -val, evs, 'kartu');
   } else if (type === 'goto') {
-    const passGo = val === 0 || val < p.pos; // maju melewati START = terima gaji
+    const passGo = val === 0 || val < p.pos;
     moveTo(r, p, val, evs, false);
     if (passGo) { p.cash += GO_SALARY; evs.push({ k: '$', p: p.id, v: GO_SALARY }); addLog(r, `${p.name} terima gaji ${rp(GO_SALARY)}`); }
     if (val !== 0) landOn(r, p, evs, diceTotal);
@@ -376,13 +399,11 @@ function doRoll(r, p, evs) {
     if (dbl) {
       p.jail = 0; p.jailTurns = 0; p.doubles = 0;
       addLog(r, `${p.name} keluar penjara dengan dadu kembar`);
-      // keluar dengan kembar: jalan tanpa giliran tambahan
       stepMove(r, p, tot, evs);
       afterMove(r, p, evs, tot, false);
     } else {
       p.jailTurns++;
       if (p.jailTurns >= 3) {
-        // wajib bayar 50 lalu jalan
         const ok = transfer(r, p, null, JAIL_FEE, evs, 'denda penjara');
         if (ok) {
           p.jail = 0; p.jailTurns = 0;
@@ -413,7 +434,6 @@ function afterMove(r, p, evs, tot, dbl) {
   r.pendingBuy = null;
   landOn(r, p, evs, tot);
   if (!p.alive) return;
-  // dadu kembar = jalan lagi (jika tidak masuk penjara)
   r.extraTurn = dbl && p.jail === 0 && p.alive;
 }
 function endTurn(r, evs) {
@@ -430,17 +450,14 @@ function endTurn(r, evs) {
   const np = r.players[r.turn];
   addLog(r, `Giliran ${np.name}`);
 }
-// Selesaikan satu aksi: cek menang, lewati pemain bangkrut/putus, kirim state
 function finish(r, evs) {
   if (checkWin(r, evs)) { emitState(r, evs, evDuration(evs)); return; }
-  // jika pemain giliran bangkrut, lanjutkan ke pemain berikutnya
   const cur = r.players[r.turn];
   if (!cur.alive) { r.extraTurn = false; r.turn = nextAlive(r, r.turn); r.phase = 'roll'; addLog(r, `Giliran ${r.players[r.turn].name}`); }
   const ms = evDuration(evs);
   armTimer(r, ms);
   emitState(r, evs, ms);
   notifyTurn(r);
-  // pemain giliran sedang putus? jadwalkan lewati
   scheduleDiscSkip(r);
 }
 function notifyTurn(r) {
@@ -448,23 +465,22 @@ function notifyTurn(r) {
   if (cur && cur.sid && r.phase === 'roll') io.to(cur.sid).emit('yourTurn');
 }
 function scheduleDiscSkip(r) {
-  // selalu bersihkan timer disc lama dulu (walau kondisi di bawah tidak cocok lagi) -
-  // kalau tidak, timer basi dari pemain/giliran sebelumnya bisa nyangkut dan nembak autoPlay() di giliran yang salah nanti
-  clearDiscTimer(r);
   const cur = r.players[r.turn];
   if (cur && !cur.connected && r.phase !== 'over' && r.phase !== 'lobby') {
-    // pemain putus: giliran dipercepat lewat timer disc
     const wait = Math.max(0, DISC_MS - (Date.now() - cur.discAt));
+    if (r.discTimer) clearTimeout(r.discTimer);
     r.discTimer = setTimeout(() => {
       const c = r.players[r.turn];
-      if (c && !c.connected && r.phase !== 'over') { const evs = []; autoPlay(r); }
+      if (c && !c.connected && r.phase !== 'over') { autoPlay(r); }
     }, wait + 200);
+  } else if (r.discTimer) {
+    clearTimeout(r.discTimer); r.discTimer = null;
   }
 }
 
 // ====== HANDLER AKSI ======
 function getCtx(sock) {
-  const r = rooms.get(sock.data.room);
+  const r = rooms.get(sock.data && sock.data.room);
   if (!r) return {};
   const p = r.players.find(x => x.tok === sock.data.tok);
   return { r, p };
@@ -483,223 +499,6 @@ function limited(sock, key, ms) {
   if ((rate.get(k) || 0) > now) return true;
   rate.set(k, now + ms); return false;
 }
-// bersihkan entri rate limit yang sudah kedaluwarsa supaya Map tidak tumbuh terus (memory leak) di server yang jalan lama
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, until] of rate) if (until < now) rate.delete(k);
-}, 300000);
 
 io.on('connection', sock => {
-  const err = m => sock.emit('err', m);
-
-  sock.on('create', d => {
-    d = d || {};
-    const code = roomCode();
-    if (!code) return err('Server penuh, coba lagi');
-    const r = makeRoom(code); rooms.set(code, r);
-    const tok = clean(d.token, 64) || token();
-    const p = newPlayer(tok, clean(d.name, 12) || 'Pemain', EMOJIS.includes(d.emoji) ? d.emoji : EMOJIS[0], COLORS.includes(d.color) ? d.color : COLORS[0], sock.id);
-    r.players.push(p); r.hostId = p.id;
-    sock.join(code); sock.data = { room: code, tok: p.tok, pid: p.id };
-    sock.emit('joined', { token: p.tok, id: p.id, code, board: boardInfo() });
-    emitState(r);
-  });
-
-  sock.on('join', d => {
-    d = d || {};
-    const code = clean(d.code, 4).toUpperCase();
-    const r = rooms.get(code);
-    if (!r) return err('Kode room salah atau room tidak ada');
-    const tok = clean(d.token, 64);
-    // reconnect: token sudah dikenal
-    let p = tok && r.players.find(x => x.tok === tok);
-    if (p) {
-      p.sid = sock.id; p.connected = true; p.discAt = 0;
-      sock.join(code); sock.data = { room: code, tok: p.tok, pid: p.id };
-      sock.emit('joined', { token: p.tok, id: p.id, code, rejoin: true, board: boardInfo() });
-      emitState(r); scheduleDiscSkip(r); return;
-    }
-    if (r.phase !== 'lobby') return err('Game sudah dimulai');
-    if (r.players.length >= 7) return err('Room penuh (maks 7 pemain)');
-    const nt = token();
-    // pilih warna/emoji unik jika bentrok
-    let color = COLORS.includes(d.color) ? d.color : COLORS[0];
-    let emoji = EMOJIS.includes(d.emoji) ? d.emoji : EMOJIS[0];
-    if (r.players.some(x => x.color === color)) color = COLORS.find(c => !r.players.some(x => x.color === c)) || color;
-    if (r.players.some(x => x.emoji === emoji)) emoji = EMOJIS.find(e => !r.players.some(x => x.emoji === e)) || emoji;
-    p = newPlayer(nt, clean(d.name, 12) || 'Pemain', emoji, color, sock.id);
-    r.players.push(p);
-    sock.join(code); sock.data = { room: code, tok: p.tok, pid: p.id };
-    sock.emit('joined', { token: p.tok, id: p.id, code, board: boardInfo() });
-    emitState(r);
-  });
-
-  sock.on('ready', () => {
-    const { r, p } = getCtx(sock);
-    if (!r || !p || r.phase !== 'lobby') return;
-    p.ready = !p.ready; emitState(r);
-  });
-  sock.on('kick', id => {
-    const { r, p } = getCtx(sock);
-    if (!r || !p || r.phase !== 'lobby' || r.hostId !== p.id) return;
-    const t = r.players.find(x => x.id === id);
-    if (!t || t.id === p.id) return;
-    r.players = r.players.filter(x => x !== t);
-    if (t.sid) { io.to(t.sid).emit('kicked'); const s = io.sockets.sockets.get(t.sid); if (s) { s.leave(r.code); s.data = {}; } }
-    emitState(r);
-  });
-  sock.on('start', () => {
-    const { r, p } = getCtx(sock);
-    if (!r || !p || r.phase !== 'lobby' || r.hostId !== p.id) return;
-    if (r.players.length < 2) return err('Minimal 2 pemain');
-    if (r.players.some(x => !x.ready)) return err('Semua pemain harus menekan Siap');
-    startGame(r);
-  });
-  function startGame(r) {
-    resetGame(r);
-    r.turn = rnd(r.players.length);
-    r.phase = 'roll';
-    r.players.forEach(x => x.connected = x.connected);
-    addLog(r, `Game dimulai! Giliran ${r.players[r.turn].name}`);
-    armTimer(r, 1500);
-    emitState(r, [{ k: 'start' }], 1500);
-    notifyTurn(r); scheduleDiscSkip(r);
-  }
-
-  sock.on('roll', () => {
-    const { r, p } = getCtx(sock);
-    const g = myTurnGuard(r, p, ['roll']);
-    if (g) return err(g);
-    const evs = []; doRoll(r, p, evs); finish(r, evs);
-  });
-  sock.on('buy', () => {
-    const { r, p } = getCtx(sock);
-    const g = myTurnGuard(r, p, ['buy']);
-    if (g) return err(g);
-    const i = r.pendingBuy && r.pendingBuy.i, s = B[i];
-    if (p.cash < s.p) return err('Uang tidak cukup');
-    const evs = [];
-    p.cash -= s.p; evs.push({ k: '$', p: p.id, v: -s.p });
-    r.owner[i] = p.id; p.props.push(i); evs.push({ k: 'own', i, p: p.id });
-    addLog(r, `${p.name} beli ${s.n} ${rp(s.p)}`);
-    r.pendingBuy = null; r.phase = 'act';
-    finish(r, evs);
-  });
-  sock.on('skip', () => {
-    const { r, p } = getCtx(sock);
-    const g = myTurnGuard(r, p, ['buy']);
-    if (g) return err(g);
-    r.pendingBuy = null; r.phase = 'act';
-    addLog(r, `${p.name} melewati ${B[p.pos].n}`);
-    finish(r, []);
-  });
-  sock.on('end', () => {
-    const { r, p } = getCtx(sock);
-    const g = myTurnGuard(r, p, ['act']);
-    if (g) return err(g);
-    const evs = []; endTurn(r, evs); finish(r, evs);
-  });
-  sock.on('build', i => {
-    const { r, p } = getCtx(sock);
-    // boleh membangun saat giliran sendiri di fase roll atau act
-    const g = myTurnGuard(r, p, ['roll', 'act']);
-    if (g) return err(g);
-    i = Number(i);
-    if (!Number.isInteger(i) || !B[i] || B[i].t !== 'prop' || r.owner[i] !== p.id) return err('Tidak bisa membangun di sini');
-    const gr = B[i].g;
-    if (!ownsSet(r, p.id, gr)) return err('Kamu harus punya satu set warna lengkap');
-    const h = r.houses[i] || 0;
-    if (h >= 5) return err('Sudah hotel');
-    const hs = GROUPS[gr].map(x => r.houses[x] || 0);
-    if (h > Math.min(...hs)) return err('Bangun merata dulu di petak lain');
-    const cost = HOUSE_COST[gr];
-    if (p.cash < cost) return err('Uang tidak cukup');
-    p.cash -= cost; r.houses[i] = h + 1;
-    addLog(r, `${p.name} bangun ${h + 1 === 5 ? 'hotel' : 'rumah'} di ${B[i].n} (${rp(cost)})`);
-    finish(r, [{ k: '$', p: p.id, v: -cost }, { k: 'bd', i, h: h + 1 }]);
-  });
-  sock.on('payjail', () => {
-    const { r, p } = getCtx(sock);
-    const g = myTurnGuard(r, p, ['roll']);
-    if (g) return err(g);
-    if (p.jail <= 0) return err('Kamu tidak di penjara');
-    if (p.cash < JAIL_FEE) return err('Uang tidak cukup');
-    p.cash -= JAIL_FEE; p.jail = 0; p.jailTurns = 0;
-    addLog(r, `${p.name} bayar ${rp(JAIL_FEE)} untuk keluar penjara`);
-    finish(r, [{ k: '$', p: p.id, v: -JAIL_FEE }]);
-  });
-  sock.on('react', e => {
-    const { r, p } = getCtx(sock);
-    if (!r || !p) return;
-    if (!['👏', '😂', '😭', '🔥'].includes(e)) return;
-    if (limited(sock, 'react', 1200)) return;
-    io.to(r.code).emit('react', { p: p.id, e });
-  });
-  sock.on('rematch', () => {
-    const { r, p } = getCtx(sock);
-    if (!r || !p || r.phase !== 'over' || r.hostId !== p.id) return;
-    r.phase = 'lobby'; r.players = r.players.filter(x => x.connected);
-    r.players.forEach(x => { x.ready = false; });
-    if (!r.players.find(x => x.id === r.hostId)) r.hostId = r.players[0] && r.players[0].id;
-    clearTimer(r); // pastikan timer giliran/disc game sebelumnya tidak nyangkut ke game yang baru
-    resetGame(r); r.phase = 'lobby';
-    emitState(r, [{ k: 'lobby' }], 0);
-  });
-  sock.on('leave', () => {
-    const { r, p } = getCtx(sock);
-    if (!r || !p) return;
-    leaveRoom(r, p, sock);
-  });
-  sock.on('sync', () => { const { r } = getCtx(sock); if (r) sock.emit('state', { s: publicState(r), ev: [], seq: r.seq, ms: 0, t: Date.now() }); });
-
-  sock.on('disconnect', () => {
-    const { r, p } = getCtx(sock);
-    if (!r || !p || p.sid !== sock.id) return;
-    p.connected = false; p.discAt = Date.now();
-    if (r.phase === 'lobby') {
-      // di lobby: hapus setelah 30 detik tidak kembali
-      setTimeout(() => {
-        if (!p.connected && r.phase === 'lobby') { r.players = r.players.filter(x => x !== p); fixHost(r); emitState(r); cleanupRoom(r); }
-      }, 30000);
-    } else scheduleDiscSkip(r);
-    emitState(r);
-  });
-});
-
-function fixHost(r) {
-  if (!r.players.find(x => x.id === r.hostId)) {
-    const nh = r.players.find(x => x.connected) || r.players[0];
-    r.hostId = nh ? nh.id : null;
-  }
-}
-function leaveRoom(r, p, sock) {
-  sock.leave(r.code); sock.data = {};
-  if (r.phase === 'lobby' || r.phase === 'over') {
-    r.players = r.players.filter(x => x !== p); fixHost(r); emitState(r); cleanupRoom(r);
-  } else if (p.alive) {
-    // menyerah di tengah game = bangkrut ke bank
-    const evs = [];
-    addLog(r, `${p.name} menyerah`);
-    const wasTurn = r.players[r.turn] === p;
-    bankrupt(r, p, null, evs);
-    p.connected = false;
-    if (!checkWin(r, evs) && wasTurn) { r.extraTurn = false; r.turn = nextAlive(r, r.turn); r.phase = 'roll'; addLog(r, `Giliran ${r.players[r.turn].name}`); }
-    if (r.phase === 'over') emitState(r, evs, evDuration(evs)); else finish(r, evs);
-  }
-}
-function cleanupRoom(r) {
-  if (r.players.length === 0 || r.players.every(x => !x.connected)) {
-    setTimeout(() => {
-      if (r.players.every(x => !x.connected)) { clearTimer(r); rooms.delete(r.code); }
-    }, 10 * 60 * 1000);
-  }
-}
-// bersihkan room tua tiap 10 menit
-setInterval(() => {
-  for (const [c, r] of rooms) {
-    if (r.players.every(x => !x.connected) && Date.now() - (r.lastActive || 0) > 30 * 60 * 1000) { clearTimer(r); rooms.delete(c); }
-  }
-}, 600000);
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log('Monopoli jalan di port ' + PORT));
+  const err = m => s
