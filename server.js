@@ -90,8 +90,6 @@ const CHANCE = [
   ['Maju ke Bandara Soekarno-Hatta', 'goto', 35],
   ['Ulang tahun! Terima 10 dari tiap pemain', 'allget', 10],
   ['Traktir semua, bayar 10 ke tiap pemain', 'allpay', 10],
-  // PATCH 2a — RULE 6: kartu bebas penjara
-  ['Bebas dari Penjara! Simpan atau jual Rp 100 ke bank.', 'jailcard', 0],
 ];
 const CHEST = [
   ['Kesalahan bank, terima 200', 'cash', 200],
@@ -106,8 +104,6 @@ const CHEST = [
   ['Biaya rumah sakit, bayar 100', 'cash', -100],
   ['Mundur 3 petak', 'back', 3],
   ['Asuransi jatuh tempo, terima 100', 'cash', 100],
-  // PATCH 2a' — RULE 6: kartu bebas penjara
-  ['Bebas dari Penjara! Simpan atau jual Rp 100 ke bank.', 'jailcard', 0],
 ];
 
 const COLORS = ['#e53935', '#1e88e5', '#43a047', '#fdd835', '#8e24aa', '#fb8c00', '#00acc1'];
@@ -136,7 +132,6 @@ function newPlayer(tok, name, emoji, color, sid) {
     ready: false, connected: true, discAt: 0,
     cash: START_CASH, pos: 0, jail: 0, jailTurns: 0, alive: true,
     props: [], rentPaid: 0, doubles: 0, hasJailCard: false,
-    donatedThisTurn: false, // PATCH 4a — RULE 8: donasi
   };
 }
 
@@ -156,8 +151,7 @@ function resetGame(r) {
   r.winnerId = null; r.stats = null; r.extraTurn = false;
   r.chanceDeck = shuffle([...CHANCE.keys()]); r.chestDeck = shuffle([...CHEST.keys()]);
   r.players.forEach(p => {
-    // PATCH 6 — reset field baru saat rematch
-    Object.assign(p, { cash: START_CASH, pos: 0, jail: 0, jailTurns: 0, alive: true, props: [], rentPaid: 0, doubles: 0, hasJailCard: false, donatedThisTurn: false });
+    Object.assign(p, { cash: START_CASH, pos: 0, jail: 0, jailTurns: 0, alive: true, props: [], rentPaid: 0, doubles: 0, hasJailCard: false });
   });
 }
 
@@ -188,8 +182,6 @@ function publicState(r) {
     players: r.players.map(p => ({
       id: p.id, name: p.name, emoji: p.emoji, color: p.color, ready: p.ready, connected: p.connected,
       cash: p.cash, pos: p.pos, jail: p.jail, alive: p.alive, props: p.props, total: assetValue(r, p),
-      // PATCH 5 — kirim field baru ke client
-      hasJailCard: p.hasJailCard, donatedThisTurn: p.donatedThisTurn,
     })),
     cur: r.players[r.turn] ? r.players[r.turn].id : null,
   };
@@ -241,7 +233,8 @@ function autoPlay(r) {
 }
 function autoPlayInner(r) {
   const p = r.players[r.turn];
-  if (!p || !p.alive) return;
+  if (!p) return;
+  if (!p.alive) { finish(r, []); return; } // geser giliran & nyalakan timer lagi, jangan macet
   if (!p.connected && Date.now() - p.discAt >= DISC_MS - 500) {
     const ev0 = [];
     r.pendingBuy = null; r.extraTurn = false;
@@ -294,7 +287,6 @@ function bankrupt(r, p, creditor, evs) {
   });
   p.props = [];
   if (p.hasJailCard) p.hasJailCard = false;
-  p.donatedThisTurn = false;
   r.pendingBuy = null;
 }
 function nextAlive(r, from) {
@@ -368,7 +360,7 @@ function drawCard(r, p, kind, evs, diceTotal) {
     if (val > 0) { p.cash += val; evs.push({ k: '$', p: p.id, v: val }); }
     else transfer(r, p, null, -val, evs, 'kartu');
   } else if (type === 'goto') {
-    const passGo = val === 0 || val < p.pos;
+    const passGo = val < p.pos;
     moveTo(r, p, val, evs, false);
     if (passGo) { p.cash += GO_SALARY; evs.push({ k: '$', p: p.id, v: GO_SALARY }); addLog(r, `${p.name} terima gaji ${rp(GO_SALARY)}`); }
     if (val !== 0) landOn(r, p, evs, diceTotal);
@@ -382,14 +374,11 @@ function drawCard(r, p, kind, evs, diceTotal) {
     r.players.filter(x => x.alive && x.id !== p.id).forEach(x => { if (p.alive) transfer(r, x, p, val, evs, 'kartu'); });
   } else if (type === 'allpay') {
     r.players.filter(x => x.alive && x.id !== p.id).forEach(x => { if (p.alive) transfer(r, p, x, val, evs, 'kartu'); });
-  } else if (type === 'jailcard') { // PATCH 2b — RULE 6: kartu bebas penjara
-    p.hasJailCard = true;
-    addLog(r, `${p.name} dapat kartu Bebas Penjara`);
   }
 }
 
 function doRoll(r, p, evs) {
-  const d1 = 1 + rnd(6), d2 = 1 + rnd(6), tot = d1 + d2, dbl = d1 === 6 && d2 === 6; // PATCH 1 — RULE 7: hanya 6-6 yang dianggap double
+  const d1 = 1 + rnd(6), d2 = 1 + rnd(6), tot = d1 + d2, dbl = d1 === d2;
   r.dice = [d1, d2];
   evs.push({ k: 'dice', p: p.id, d: [d1, d2] });
   addLog(r, `${p.name} lempar dadu: ${d1} + ${d2}`);
@@ -448,7 +437,6 @@ function endTurn(r, evs) {
   r.turn = nextAlive(r, r.turn);
   r.phase = 'roll';
   const np = r.players[r.turn];
-  if (np) np.donatedThisTurn = false; // PATCH 4b — RULE 8: reset donasi
   addLog(r, `Giliran ${np.name}`);
 }
 function finish(r, evs) {
@@ -527,7 +515,7 @@ io.on('connection', sock => {
     let p = tok && r.players.find(x => x.tok === tok);
     if (p) {
       p.sid = sock.id; p.connected = true; p.discAt = 0;
-      sock.join(code); sock.data = { room: code, tok: p.tok, pid: p.id }
+      sock.join(code); sock.data = { room: code, tok: p.tok, pid: p.id };
       sock.emit('joined', { token: p.tok, id: p.id, code, rejoin: true, board: boardInfo() });
       emitState(r); scheduleDiscSkip(r); return;
     }
@@ -633,46 +621,6 @@ io.on('connection', sock => {
     addLog(r, `${p.name} bangun ${h + 1 === 5 ? 'hotel' : 'rumah'} di ${B[i].n} (${rp(cost)})`);
     finish(r, [{ k: '$', p: p.id, v: -cost }, { k: 'bd', i, h: h + 1 }]);
   });
-  // PATCH 3 — RULE 5: jual properti & rumah ke bank (50% refund)
-  sock.on('sell', i => {
-    const { r, p } = getCtx(sock);
-    const g = myTurnGuard(r, p, ['roll', 'act']);
-    if (g) return err(g);
-    i = Number(i);
-    if (!Number.isInteger(i) || !B[i] || r.owner[i] !== p.id) return err('Tidak bisa menjual petak ini');
-    const s = B[i];
-    if (!['prop', 'rr', 'util'].includes(s.t)) return err('Tidak bisa dijual');
-    if ((r.houses[i] || 0) > 0) return err('Jual rumahnya dulu sebelum menjual properti');
-    const refund = Math.floor(s.p / 2);
-    delete r.owner[i];
-    p.props = p.props.filter(x => x !== i);
-    p.cash += refund;
-    addLog(r, `${p.name} jual ${s.n} ke bank (${rp(refund)})`);
-    finish(r, [
-      { k: '$', p: p.id, v: refund },
-      { k: 'own', i, p: null }
-    ]);
-  });
-
-  sock.on('sellhouse', i => {
-    const { r, p } = getCtx(sock);
-    const g = myTurnGuard(r, p, ['roll', 'act']);
-    if (g) return err(g);
-    i = Number(i);
-    if (!Number.isInteger(i) || !B[i] || B[i].t !== 'prop' || r.owner[i] !== p.id) return err('Tidak bisa menjual rumah di sini');
-    const h = r.houses[i] || 0;
-    if (h <= 0) return err('Tidak ada rumah di sini');
-    const cost = HOUSE_COST[B[i].g];
-    const refund = Math.floor(cost / 2);
-    r.houses[i] = h - 1;
-    p.cash += refund;
-    addLog(r, `${p.name} jual ${h >= 5 ? 'hotel' : 'rumah'} di ${B[i].n} (${rp(refund)})`);
-    finish(r, [
-      { k: '$', p: p.id, v: refund },
-      { k: 'bd', i, h: h - 1 }
-    ]);
-  });
-
   sock.on('payjail', () => {
     const { r, p } = getCtx(sock);
     const g = myTurnGuard(r, p, ['roll']);
@@ -683,52 +631,6 @@ io.on('connection', sock => {
     addLog(r, `${p.name} bayar ${rp(JAIL_FEE)} untuk keluar penjara`);
     finish(r, [{ k: '$', p: p.id, v: -JAIL_FEE }]);
   });
-  // PATCH 2c — RULE 6: pakai / jual kartu bebas penjara
-  sock.on('usejailcard', () => {
-    const { r, p } = getCtx(sock);
-    const g = myTurnGuard(r, p, ['roll']);
-    if (g) return err(g);
-    if (p.jail <= 0) return err('Kamu tidak di penjara');
-    if (!p.hasJailCard) return err('Kamu tidak punya kartu Bebas Penjara');
-    p.hasJailCard = false;
-    p.jail = 0; p.jailTurns = 0; p.doubles = 0;
-    addLog(r, `${p.name} pakai kartu Bebas Penjara`);
-    finish(r, []);
-  });
-
-  sock.on('selljailcard', () => {
-    const { r, p } = getCtx(sock);
-    const g = myTurnGuard(r, p, ['roll', 'act']);
-    if (g) return err(g);
-    if (!p.hasJailCard) return err('Kamu tidak punya kartu Bebas Penjara');
-    p.hasJailCard = false;
-    p.cash += 100;
-    addLog(r, `${p.name} jual kartu Bebas Penjara ke bank (${rp(100)})`);
-    finish(r, [{ k: '$', p: p.id, v: 100 }]);
-  });
-
-  // PATCH 4c — RULE 8: donasi max 25, sekali per putaran
-  sock.on('donate', d => {
-    d = d || {};
-    const { r, p } = getCtx(sock);
-    const g = myTurnGuard(r, p, ['roll', 'act']);
-    if (g) return err(g);
-    if (p.donatedThisTurn) return err('Sudah donasi di putaran ini');
-    const amount = Math.min(25, Math.floor(Number(d.amount) || 0));
-    if (amount <= 0) return err('Jumlah tidak valid (1-25)');
-    if (p.cash < amount) return err('Uang tidak cukup');
-    const target = r.players.find(x => x.id === d.to);
-    if (!target || !target.alive || target.id === p.id) return err('Pemain tujuan tidak valid');
-    p.cash -= amount;
-    target.cash += amount;
-    p.donatedThisTurn = true;
-    addLog(r, `${p.name} donasi ${rp(amount)} ke ${target.name}`);
-    finish(r, [
-      { k: '$', p: p.id, v: -amount },
-      { k: '$', p: target.id, v: amount }
-    ]);
-  });
-
   sock.on('react', e => {
     const { r, p } = getCtx(sock);
     if (!r || !p) return;
@@ -753,6 +655,7 @@ io.on('connection', sock => {
   sock.on('sync', () => { const { r } = getCtx(sock); if (r) sock.emit('state', { s: publicState(r), ev: [], seq: r.seq, ms: 0, t: Date.now() }); });
 
   sock.on('disconnect', () => {
+    for (const k of rate.keys()) if (k.startsWith(sock.id)) rate.delete(k);
     const { r, p } = getCtx(sock);
     if (!r || !p || p.sid !== sock.id) return;
     p.connected = false; p.discAt = Date.now();
