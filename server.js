@@ -1,7 +1,6 @@
 // Monopoli multiplayer - server otoritatif (Express + Socket.IO)
 const express = require('express');
 const http = require('http');
-const path = require('path');
 const crypto = require('crypto');
 const { Server } = require('socket.io');
 
@@ -16,7 +15,7 @@ const io = new Server(server, {
   pingInterval: 10000, pingTimeout: 20000,
 });
 
-app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+app.get('/', (req, res) => res.send('ok'));
 app.get('/healthz', (req, res) => res.send('ok'));
 
 // ====== SAFETY NET ======
